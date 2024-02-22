@@ -1,0 +1,21 @@
+name: 'QueFaireAParis-Semaine'
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '0 12 * * 1'
+ 
+jobs:
+  Save-Page:
+    runs-on: ubuntu-latest
+    steps:
+      - name: CheckOut
+        uses: actions/checkout@v3
+        
+      - name: Submit Request
+        env: 
+            ID: ${{ secrets.ID }}
+            KEY: ${{ secrets.KEY }}
+            URL: https://www.paris.fr/quefaire/semaine
+        run: |
+          curl -X POST -H "Accept: application/json" -H "Authorization: LOW $ID:$KEY" -d"url=$URL&capture_all=1&delay_wb_availability=1&skip_first_archive=1" "https://web.archive.org/save"
