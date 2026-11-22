@@ -5,17 +5,158 @@ on:
   schedule:
     - cron: '0 12 * * 6'
  
+permissions:
+  contents: read
+
 jobs:
   Save-Page:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
+
     steps:
-      - name: CheckOut
-        uses: actions/checkout@main
-        
-      - name: Submit Request
-        env: 
-            ID: ${{ secrets.ID }}
-            KEY: ${{ secrets.KEY }}
-            URL: https://www.paris.fr/quefaire/week-end
+      - name: Check API Credentials
+        env:
+          ID: ${{ secrets.ID }}
+          KEY: ${{ secrets.KEY }}
         run: |
-          curl -X POST -H "Accept: application/json" -H "Authorization: LOW $ID:$KEY" -d"url=$URL&capture_all=1&delay_wb_availability=1&skip_first_archive=1" "https://web.archive.org/save"
+          set -euo pipefail
+
+          if [[ -z "$ID" || -z "$KEY" ]]; then
+            echo "::error::Missing ID or KEY GitHub Secrets"
+            exit 1
+          fi
+
+          RESPONSE=$(curl --silent --show-error --fail \
+            -H "Accept: application/json" \
+            -H "Authorization: LOW ${ID}:${KEY}" \
+            "https://web.archive.org/save/status/user")
+
+          echo "Wayback Machine API authentication successful."
+          echo "$RESPONSE" | jq .
+
+      - name: Submit Capture Request
+        id: capture
+        env:
+          ID: ${{ secrets.ID }}
+          KEY: ${{ secrets.KEY }}
+          URL: https://www.paris.fr/quefaire/week-end
+        run: |
+          set -euo pipefail
+
+          # Optional parameters:
+          # --data-urlencode "delay_wb_availability=1" \
+          # --data-urlencode "skip_first_archive=1" \
+
+          # Record request submission time
+          REQUEST_STARTED_EPOCH=$(date -u +%s)
+          echo "request_started_epoch=$REQUEST_STARTED_EPOCH" >> "$GITHUB_OUTPUT"
+
+          RESPONSE=$(curl --silent --show-error --fail-with-body \
+            --max-time 120 \
+            -X POST \
+            -H "Accept: application/json" \
+            -H "Authorization: LOW ${ID}:${KEY}" \
+            --data-urlencode "url=${URL}" \
+            --data-urlencode "capture_outlinks=1" \
+            "https://web.archive.org/save")
+
+          echo "$RESPONSE" | jq .
+
+          JOB_ID=$(echo "$RESPONSE" | jq -r '.job_id // empty')
+
+          if [[ -z "$JOB_ID" ]]; then
+            echo "::error::Wayback Machine did not return a job_id"
+            exit 1
+          fi
+
+          echo "job_id=$JOB_ID" >> "$GITHUB_OUTPUT"
+          echo "Capture job submitted: $JOB_ID"
+
+      
+      - name: Wait for Capture Completion
+        env:
+          ID: ${{ secrets.ID }}
+          KEY: ${{ secrets.KEY }}
+          JOB_ID: ${{ steps.capture.outputs.job_id }}
+          REQUEST_STARTED_EPOCH: ${{ steps.capture.outputs.request_started_epoch }}
+        run: |
+          set -euo pipefail
+
+          STATUS_URL="https://web.archive.org/save/status/${JOB_ID}"
+
+          for i in $(seq 1 60); do
+            RESPONSE=$(curl --silent --show-error --fail \
+              --max-time 30 \
+              -H "Accept: application/json" \
+              -H "Authorization: LOW ${ID}:${KEY}" \
+              "$STATUS_URL")
+
+            STATUS=$(echo "$RESPONSE" | jq -r '.status // "unknown"')
+
+            echo "Attempt $i/60 - Status: $STATUS"
+
+            if [[ "$STATUS" == "success" ]]; then
+              TIMESTAMP=$(echo "$RESPONSE" | jq -r '.timestamp // empty')
+              ORIGINAL_URL=$(echo "$RESPONSE" | jq -r '.original_url // empty')
+
+              if [[ ! "$TIMESTAMP" =~ ^[0-9]{14}$ || -z "$ORIGINAL_URL" ]]; then
+                echo "::error::Invalid archive timestamp or URL"
+                echo "$RESPONSE" | jq .
+                exit 1
+              fi
+
+              ARCHIVE_URL="https://web.archive.org/web/${TIMESTAMP}/${ORIGINAL_URL}"
+
+              # Convert archive timestamp to Unix time
+              ARCHIVE_EPOCH=$(date -u -d \
+                "${TIMESTAMP:0:4}-${TIMESTAMP:4:2}-${TIMESTAMP:6:2} ${TIMESTAMP:8:2}:${TIMESTAMP:10:2}:${TIMESTAMP:12:2} UTC" +%s)
+
+              # Format timestamps in UTC and Paris local time
+              UTC_TIME=$(date -u -d "@${ARCHIVE_EPOCH}" '+%Y-%m-%d %H:%M:%S')
+              PARIS_TIME=$(TZ=Europe/Paris date -d "@${ARCHIVE_EPOCH}" '+%Y-%m-%d %H:%M:%S %Z')
+
+              if (( ARCHIVE_EPOCH <= REQUEST_STARTED_EPOCH )); then
+                ARCHIVE_TYPE="Previously archived snapshot (reused)"
+              else
+                ARCHIVE_TYPE="Captured during this workflow run"
+              fi
+
+              echo "::notice::Capture successful!"
+              echo "Archived URL: ${ARCHIVE_URL}"
+              echo "Archive time: ${PARIS_TIME}"
+
+              # Generate GitHub Actions Run Summary
+              cat >> "$GITHUB_STEP_SUMMARY" <<EOF
+          # Wayback Machine Archive
+
+          <a href="${ARCHIVE_URL}"><strong>View Archived Page</strong></a>
+
+          ## Archive Information
+
+          | Property | Value |
+          |:---|:---|
+          | Page | [Que Faire à Paris - Weekend](${ORIGINAL_URL}) |
+          | Archive Time (Paris) | **${PARIS_TIME}** |
+          | Archive Time (UTC) | ${UTC_TIME} |
+          | Archive Timestamp | \`${TIMESTAMP}\` |
+          | Capture Type | ${ARCHIVE_TYPE} |
+          | Job ID | \`${JOB_ID}\` |
+          | Status | Success |
+
+          > The displayed time is the actual Wayback Machine archive timestamp, not the GitHub Actions run time.
+          EOF
+
+              exit 0
+            fi
+
+            if [[ "$STATUS" == "error" ]]; then
+              echo "$RESPONSE" | jq .
+              echo "::error::Wayback Machine capture failed"
+              exit 1
+            fi
+
+            sleep 10
+          done
+
+          echo "::error::Capture timed out waiting for completion"
+          exit 1
