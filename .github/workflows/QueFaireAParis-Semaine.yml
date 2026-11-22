@@ -48,6 +48,10 @@ jobs:
           # --data-urlencode "delay_wb_availability=1" \
           # --data-urlencode "skip_first_archive=1" \
 
+          # Record request submission time
+          REQUEST_STARTED_EPOCH=$(date -u +%s)
+          echo "request_started_epoch=$REQUEST_STARTED_EPOCH" >> "$GITHUB_OUTPUT"
+
           RESPONSE=$(curl --silent --show-error --fail-with-body \
             --max-time 120 \
             -X POST \
@@ -69,11 +73,13 @@ jobs:
           echo "job_id=$JOB_ID" >> "$GITHUB_OUTPUT"
           echo "Capture job submitted: $JOB_ID"
 
+      
       - name: Wait for Capture Completion
         env:
           ID: ${{ secrets.ID }}
           KEY: ${{ secrets.KEY }}
           JOB_ID: ${{ steps.capture.outputs.job_id }}
+          REQUEST_STARTED_EPOCH: ${{ steps.capture.outputs.request_started_epoch }}
         run: |
           set -euo pipefail
 
@@ -91,11 +97,56 @@ jobs:
             echo "Attempt $i/60 - Status: $STATUS"
 
             if [[ "$STATUS" == "success" ]]; then
-              TIMESTAMP=$(echo "$RESPONSE" | jq -r '.timestamp')
-              ORIGINAL_URL=$(echo "$RESPONSE" | jq -r '.original_url')
+              TIMESTAMP=$(echo "$RESPONSE" | jq -r '.timestamp // empty')
+              ORIGINAL_URL=$(echo "$RESPONSE" | jq -r '.original_url // empty')
+
+              if [[ ! "$TIMESTAMP" =~ ^[0-9]{14}$ || -z "$ORIGINAL_URL" ]]; then
+                echo "::error::Invalid archive timestamp or URL"
+                echo "$RESPONSE" | jq .
+                exit 1
+              fi
+
+              ARCHIVE_URL="https://web.archive.org/web/${TIMESTAMP}/${ORIGINAL_URL}"
+
+              # Convert archive timestamp to Unix time
+              ARCHIVE_EPOCH=$(date -u -d \
+                "${TIMESTAMP:0:4}-${TIMESTAMP:4:2}-${TIMESTAMP:6:2} ${TIMESTAMP:8:2}:${TIMESTAMP:10:2}:${TIMESTAMP:12:2} UTC" +%s)
+
+              # Format timestamps in UTC and Paris local time
+              UTC_TIME=$(date -u -d "@${ARCHIVE_EPOCH}" '+%Y-%m-%d %H:%M:%S')
+              PARIS_TIME=$(TZ=Europe/Paris date -d "@${ARCHIVE_EPOCH}" '+%Y-%m-%d %H:%M:%S %Z')
+
+              if (( ARCHIVE_EPOCH <= REQUEST_STARTED_EPOCH )); then
+                ARCHIVE_TYPE="Previously archived snapshot (reused)"
+              else
+                ARCHIVE_TYPE="Captured during this workflow run"
+              fi
 
               echo "::notice::Capture successful!"
-              echo "Archived URL: https://web.archive.org/web/${TIMESTAMP}/${ORIGINAL_URL}"
+              echo "Archived URL: ${ARCHIVE_URL}"
+              echo "Archive time: ${PARIS_TIME}"
+
+              # Generate GitHub Actions Run Summary
+              cat >> "$GITHUB_STEP_SUMMARY" <<EOF
+          # Wayback Machine Archive
+
+          <a href="${ARCHIVE_URL}"><strong>View Archived Page</strong></a>
+
+          ## Archive Information
+
+          | Property | Value |
+          |:---|:---|
+          | Page | [Que Faire à Paris - Semaine](${ORIGINAL_URL}) |
+          | Archive Time (Paris) | **${PARIS_TIME}** |
+          | Archive Time (UTC) | ${UTC_TIME} |
+          | Archive Timestamp | \`${TIMESTAMP}\` |
+          | Capture Type | ${ARCHIVE_TYPE} |
+          | Job ID | \`${JOB_ID}\` |
+          | Status | Success |
+
+          > The displayed time is the actual Wayback Machine archive timestamp, not the GitHub Actions run time.
+          EOF
+
               exit 0
             fi
 
