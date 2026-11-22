@@ -44,6 +44,10 @@ jobs:
         run: |
           set -euo pipefail
 
+          # Optional parameters:
+          # --data-urlencode "delay_wb_availability=1" \
+          # --data-urlencode "skip_first_archive=1" \
+
           RESPONSE=$(curl --silent --show-error --fail-with-body \
             --max-time 120 \
             -X POST \
@@ -51,10 +55,6 @@ jobs:
             -H "Authorization: LOW ${ID}:${KEY}" \
             --data-urlencode "url=${URL}" \
             --data-urlencode "capture_outlinks=1" \
-            \
-            # Optional parameters:
-            # --data-urlencode "delay_wb_availability=1" \
-            # --data-urlencode "skip_first_archive=1" \
             "https://web.archive.org/save")
 
           echo "$RESPONSE" | jq .
